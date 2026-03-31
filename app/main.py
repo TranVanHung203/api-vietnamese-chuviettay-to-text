@@ -1,10 +1,14 @@
 import base64
 import io
 import os
+import re
+import unicodedata
+from difflib import SequenceMatcher
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import torch
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
@@ -23,11 +27,49 @@ SUPPORTED_MODELS = {
 
 APP_DIR = Path(__file__).resolve().parent
 UI_FILE = APP_DIR / "static" / "index.html"
+NUMBER_WORDS = {
+    "không",
+    "một",
+    "hai",
+    "ba",
+    "bốn",
+    "năm",
+    "sáu",
+    "bảy",
+    "tám",
+    "chín",
+    "tư",
+    "lăm",
+    "mốt",
+    "linh",
+    "lẻ",
+    "mười",
+    "mươi",
+    "trăm",
+    "nghìn",
+    "ngàn",
+    "triệu",
+    "tỷ",
+    "chục",
+    "đơn vị",
+    "nhăm",
+}
+NUMBER_WORDS_SINGLE = sorted(
+    [word for word in NUMBER_WORDS if " " not in word], key=len, reverse=True
+)
+DON_VI_PLAIN = "don vi"
+DONVI_PLAIN = "donvi"
+WORD_TOKEN_RE = re.compile(r"[^\W\d_]+", flags=re.UNICODE)
 
 
 class OCRResponse(BaseModel):
     text: str
     probability: Optional[float] = None
+    lines: Optional[list[str]] = None
+    line_probabilities: Optional[list[Optional[float]]] = None
+    raw_text: Optional[str] = None
+    raw_lines: Optional[list[str]] = None
+    number_word_mode: bool = False
     model: str
     device: str
 
@@ -35,6 +77,8 @@ class OCRResponse(BaseModel):
 class OCRBase64Request(BaseModel):
     image_base64: str = Field(..., description="Raw base64 or data URI")
     return_prob: bool = False
+    multiline: bool = True
+    number_word_mode: bool = False
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -69,6 +113,171 @@ def _decode_base64_image(raw_value: str) -> bytes:
         raise HTTPException(status_code=400, detail="Invalid base64 payload") from exc
 
 
+def _strip_diacritics(value: str) -> str:
+    normalized = unicodedata.normalize("NFD", value)
+    without_marks = "".join(
+        ch for ch in normalized if unicodedata.category(ch) != "Mn"
+    )
+    return without_marks.replace("đ", "d").replace("Đ", "D")
+
+
+NUMBER_WORDS_PLAIN = {
+    word: _strip_diacritics(word.lower()) for word in NUMBER_WORDS_SINGLE
+}
+PLAIN_TO_NUMBER_WORDS: dict[str, list[str]] = {}
+for word, plain in NUMBER_WORDS_PLAIN.items():
+    PLAIN_TO_NUMBER_WORDS.setdefault(plain, []).append(word)
+
+# Ưu tiên dạng chuẩn khi token không dấu bị trùng nhiều từ (vd: mot -> một/mốt).
+PLAIN_WORD_PREFERENCE = {
+    "mot": "một",
+    "muoi": "mười",
+    "nam": "năm",
+}
+
+
+def _normalize_number_token(token: str) -> str:
+    lowered = token.lower()
+    if lowered in NUMBER_WORDS:
+        return lowered
+
+    token_plain = _strip_diacritics(lowered)
+    if token_plain in PLAIN_TO_NUMBER_WORDS:
+        candidates = PLAIN_TO_NUMBER_WORDS[token_plain]
+        preferred = PLAIN_WORD_PREFERENCE.get(token_plain)
+        if preferred and preferred in candidates:
+            return preferred
+        return sorted(candidates)[0]
+
+    best_word = lowered
+    best_score = 0.0
+    for candidate, candidate_plain in NUMBER_WORDS_PLAIN.items():
+        score = SequenceMatcher(None, token_plain, candidate_plain).ratio()
+        if score > best_score:
+            best_score = score
+            best_word = candidate
+
+    # Fuzzy threshold vừa đủ để sửa sai OCR phổ biến, tránh sửa quá tay.
+    if best_score >= 0.72:
+        return best_word
+    return lowered
+
+
+def _looks_like_don_vi_pair(first: str, second: str) -> bool:
+    pair_plain = f"{_strip_diacritics(first.lower())} {_strip_diacritics(second.lower())}"
+    if pair_plain == DON_VI_PLAIN:
+        return True
+    return SequenceMatcher(None, pair_plain, DON_VI_PLAIN).ratio() >= 0.78
+
+
+def _looks_like_don_vi_single(token: str) -> bool:
+    token_plain = _strip_diacritics(token.lower())
+    if token_plain == DONVI_PLAIN:
+        return True
+    return SequenceMatcher(None, token_plain, DONVI_PLAIN).ratio() >= 0.82
+
+
+def _normalize_number_words_line(text: str) -> str:
+    tokens = WORD_TOKEN_RE.findall(text.lower())
+    if not tokens:
+        return text.strip().lower()
+
+    out: list[str] = []
+    i = 0
+    while i < len(tokens):
+        if i + 1 < len(tokens) and _looks_like_don_vi_pair(tokens[i], tokens[i + 1]):
+            out.append("đơn vị")
+            i += 2
+            continue
+
+        if _looks_like_don_vi_single(tokens[i]):
+            out.append("đơn vị")
+            i += 1
+            continue
+
+        out.append(_normalize_number_token(tokens[i]))
+        i += 1
+
+    return " ".join(out).strip()
+
+
+def _line_bounds_from_mask(ink_mask: np.ndarray) -> list[tuple[int, int]]:
+    height, width = ink_mask.shape
+    if height == 0 or width == 0:
+        return []
+
+    row_sum = ink_mask.sum(axis=1)
+    row_threshold = max(2, int(width * 0.01))
+    active_rows = row_sum >= row_threshold
+
+    spans: list[tuple[int, int]] = []
+    start = None
+    for idx, is_active in enumerate(active_rows):
+        if is_active and start is None:
+            start = idx
+        elif not is_active and start is not None:
+            end = idx - 1
+            if end - start + 1 >= 6:
+                spans.append((start, end))
+            start = None
+    if start is not None:
+        end = len(active_rows) - 1
+        if end - start + 1 >= 6:
+            spans.append((start, end))
+
+    merged: list[tuple[int, int]] = []
+    max_gap = 10
+    for span in spans:
+        if not merged:
+            merged.append(span)
+            continue
+        prev_start, prev_end = merged[-1]
+        cur_start, cur_end = span
+        if cur_start - prev_end <= max_gap:
+            merged[-1] = (prev_start, cur_end)
+        else:
+            merged.append(span)
+    return merged
+
+
+def _split_lines(image: Image.Image) -> list[Image.Image]:
+    gray = np.array(image.convert("L"))
+    ink_mask = gray < 245
+    if ink_mask.sum() < 20:
+        return [image]
+
+    spans = _line_bounds_from_mask(ink_mask)
+    if len(spans) <= 1:
+        return [image]
+
+    lines: list[Image.Image] = []
+    width = image.width
+    for top, bottom in spans:
+        top = max(0, top - 8)
+        bottom = min(image.height - 1, bottom + 8)
+        line_mask = ink_mask[top : bottom + 1, :]
+        col_sum = line_mask.sum(axis=0)
+        col_threshold = max(1, int((bottom - top + 1) * 0.02))
+        active_cols = np.where(col_sum >= col_threshold)[0]
+        if len(active_cols) == 0:
+            continue
+
+        left = max(0, int(active_cols[0]) - 8)
+        right = min(width - 1, int(active_cols[-1]) + 8)
+        if right - left < 5:
+            continue
+
+        line_ink_count = int(line_mask[:, left : right + 1].sum())
+        if line_ink_count < 20:
+            continue
+
+        lines.append(image.crop((left, top, right + 1, bottom + 1)))
+
+    if not lines:
+        return [image]
+    return lines
+
+
 class OCRService:
     def __init__(self) -> None:
         model_name = os.getenv("VIETOCR_MODEL", "vgg_transformer")
@@ -91,16 +300,86 @@ class OCRService:
         self.beamsearch = beamsearch
         self.predictor = Predictor(config)
 
-    def recognize(self, image: Image.Image, return_prob: bool) -> OCRResponse:
+    def _predict_one(
+        self, image: Image.Image, return_prob: bool
+    ) -> tuple[str, Optional[float]]:
         if return_prob:
             text, prob = self.predictor.predict(image, return_prob=True)
-            probability = None if prob is None else float(prob)
-        else:
-            text = self.predictor.predict(image, return_prob=False)
-            probability = None
+            return text, (None if prob is None else float(prob))
+        text = self.predictor.predict(image, return_prob=False)
+        return text, None
+
+    def recognize(
+        self,
+        image: Image.Image,
+        return_prob: bool,
+        multiline: bool,
+        number_word_mode: bool,
+    ) -> OCRResponse:
+        if not multiline:
+            text, probability = self._predict_one(image=image, return_prob=return_prob)
+            raw_text = None
+            if number_word_mode:
+                normalized_text = _normalize_number_words_line(text)
+                raw_text = text if normalized_text != text else None
+                text = normalized_text
+            return OCRResponse(
+                text=text,
+                probability=probability,
+                raw_text=raw_text,
+                number_word_mode=number_word_mode,
+                model=self.model_name,
+                device=self.device,
+            )
+
+        line_images = _split_lines(image)
+        if len(line_images) <= 1:
+            text, probability = self._predict_one(image=image, return_prob=return_prob)
+            raw_text = None
+            if number_word_mode:
+                normalized_text = _normalize_number_words_line(text)
+                raw_text = text if normalized_text != text else None
+                text = normalized_text
+            return OCRResponse(
+                text=text,
+                probability=probability,
+                lines=[text],
+                line_probabilities=[probability],
+                raw_text=raw_text,
+                raw_lines=[raw_text] if raw_text else None,
+                number_word_mode=number_word_mode,
+                model=self.model_name,
+                device=self.device,
+            )
+
+        lines: list[str] = []
+        line_probs: list[Optional[float]] = []
+        for line_image in line_images:
+            line_text, line_prob = self._predict_one(
+                image=line_image, return_prob=return_prob
+            )
+            lines.append(line_text)
+            line_probs.append(line_prob)
+
+        raw_lines = None
+        if number_word_mode:
+            original_lines = list(lines)
+            lines = [_normalize_number_words_line(line) for line in lines]
+            if lines != original_lines:
+                raw_lines = original_lines
+
+        merged_text = "\n".join(lines)
+        valid_probs = [p for p in line_probs if p is not None]
+        probability = None if not valid_probs else sum(valid_probs) / len(valid_probs)
+
         return OCRResponse(
-            text=text,
+            text=merged_text,
             probability=probability,
+            lines=lines,
+            line_probabilities=line_probs,
+            raw_text=("\n".join(raw_lines) if raw_lines else None),
+            raw_lines=raw_lines,
+            number_word_mode=number_word_mode,
             model=self.model_name,
             device=self.device,
         )
@@ -147,6 +426,8 @@ def test_ui() -> FileResponse:
 async def ocr_from_file(
     file: UploadFile = File(...),
     return_prob: bool = False,
+    multiline: bool = True,
+    number_word_mode: bool = False,
 ) -> OCRResponse:
     content = await file.read()
     if not content:
@@ -154,7 +435,12 @@ async def ocr_from_file(
 
     image = _open_image(content)
     service = get_ocr_service()
-    return service.recognize(image=image, return_prob=return_prob)
+    return service.recognize(
+        image=image,
+        return_prob=return_prob,
+        multiline=multiline,
+        number_word_mode=number_word_mode,
+    )
 
 
 @app.post("/ocr/base64", response_model=OCRResponse)
@@ -162,4 +448,9 @@ def ocr_from_base64(payload: OCRBase64Request) -> OCRResponse:
     image_bytes = _decode_base64_image(payload.image_base64)
     image = _open_image(image_bytes)
     service = get_ocr_service()
-    return service.recognize(image=image, return_prob=payload.return_prob)
+    return service.recognize(
+        image=image,
+        return_prob=payload.return_prob,
+        multiline=payload.multiline,
+        number_word_mode=payload.number_word_mode,
+    )

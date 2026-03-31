@@ -238,6 +238,14 @@
                 Nét bút:
                 <input id="pen-size" type="range" min="1" max="20" step="1" value="4" />
               </label>
+              <label for="multiline-enabled">
+                <input id="multiline-enabled" type="checkbox" checked />
+                Nhận diện nhiều dòng
+              </label>
+              <label for="number-word-mode">
+                <input id="number-word-mode" type="checkbox" />
+                Ưu tiên từ đọc số
+              </label>
               <label for="crop-enabled">
                 <input id="crop-enabled" type="checkbox" checked />
                 Cắt vùng chữ trước khi gửi
@@ -284,6 +292,8 @@
       const canvas = document.getElementById("pad");
       const ctx = canvas.getContext("2d");
       const penSizeInput = document.getElementById("pen-size");
+      const multilineEnabledInput = document.getElementById("multiline-enabled");
+      const numberWordModeInput = document.getElementById("number-word-mode");
       const cropEnabledInput = document.getElementById("crop-enabled");
       const btnDetect = document.getElementById("btn-detect");
       const btnClear = document.getElementById("btn-clear");
@@ -443,6 +453,8 @@
             body: JSON.stringify({
               image_base64: imageBase64,
               return_prob: false,
+              multiline: multilineEnabledInput.checked,
+              number_word_mode: numberWordModeInput.checked,
             }),
           });
 
@@ -451,10 +463,18 @@
             throw new Error(payload.detail || "OCR request failed");
           }
 
-          resultEl.value = payload.text || "";
+          if (Array.isArray(payload.lines) && payload.lines.length > 1) {
+            resultEl.value = payload.lines.join("\n");
+          } else {
+            resultEl.value = payload.text || "";
+          }
           metaModelEl.textContent = payload.model || "-";
           metaDeviceEl.textContent = payload.device || "-";
-          setStatus("Nhận diện xong.");
+          if (payload.number_word_mode && payload.raw_text) {
+            setStatus("Nhận diện xong (đã chuẩn hóa theo từ điển số).");
+          } else {
+            setStatus("Nhận diện xong.");
+          }
         } catch (err) {
           setStatus(`Lỗi: ${err.message}`, true);
         } finally {

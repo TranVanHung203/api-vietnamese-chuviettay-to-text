@@ -52,12 +52,17 @@ curl -X POST "http://localhost:8000/ocr/file" \
   -F "file=@test.jpg"
 ```
 
+Mặc định endpoint bật `multiline=true` để nhận diện ảnh nhiều dòng.
+`number_word_mode` mặc định là `false`.
+Chỉ khi bật `true` mới chuẩn hóa về nhóm từ đọc số
+(`một`, `mười`, `trăm`, `nghìn`, `triệu`, `tỷ`, ...).
+
 ### OCR từ base64
 
 ```bash
 curl -X POST "http://localhost:8000/ocr/base64" \
   -H "Content-Type: application/json" \
-  -d "{\"image_base64\":\"<BASE64_IMAGE>\",\"return_prob\":false}"
+  -d "{\"image_base64\":\"<BASE64_IMAGE>\",\"return_prob\":false,\"multiline\":true,\"number_word_mode\":false}"
 ```
 
 ## Lưu ý chất lượng nhận diện
