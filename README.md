@@ -56,13 +56,19 @@ Mặc định endpoint bật `multiline=true` để nhận diện ảnh nhiều 
 `number_word_mode` mặc định là `false`.
 Chỉ khi bật `true` mới chuẩn hóa về nhóm từ đọc số
 (`một`, `mười`, `trăm`, `nghìn`, `triệu`, `tỷ`, ...).
+`number_digit_mode` mặc định là `false`.
+Khi bật `true`, API ưu tiên chuẩn hóa số về dạng chữ số `0-9`
+(`không`, `một`, `hai`, ... -> `0`, `1`, `2`, ...).
+Trong mode này, token dạng chữ sẽ luôn được map về chữ số gần nhất
+(không giữ lại chữ trong kết quả đã chuẩn hóa).
+Không bật đồng thời `number_word_mode=true` và `number_digit_mode=true`.
 
 ### OCR từ base64
 
 ```bash
 curl -X POST "http://localhost:8000/ocr/base64" \
   -H "Content-Type: application/json" \
-  -d "{\"image_base64\":\"<BASE64_IMAGE>\",\"return_prob\":false,\"multiline\":true,\"number_word_mode\":false}"
+  -d "{\"image_base64\":\"<BASE64_IMAGE>\",\"return_prob\":false,\"multiline\":true,\"number_word_mode\":false,\"number_digit_mode\":false}"
 ```
 
 ## Lưu ý chất lượng nhận diện

@@ -246,6 +246,10 @@
                 <input id="number-word-mode" type="checkbox" />
                 Ưu tiên từ đọc số
               </label>
+              <label for="number-digit-mode">
+                <input id="number-digit-mode" type="checkbox" checked />
+                Ưu tiên chữ số 0-9
+              </label>
               <label for="crop-enabled">
                 <input id="crop-enabled" type="checkbox" checked />
                 Cắt vùng chữ trước khi gửi
@@ -294,6 +298,7 @@
       const penSizeInput = document.getElementById("pen-size");
       const multilineEnabledInput = document.getElementById("multiline-enabled");
       const numberWordModeInput = document.getElementById("number-word-mode");
+      const numberDigitModeInput = document.getElementById("number-digit-mode");
       const cropEnabledInput = document.getElementById("crop-enabled");
       const btnDetect = document.getElementById("btn-detect");
       const btnClear = document.getElementById("btn-clear");
@@ -455,6 +460,7 @@
               return_prob: false,
               multiline: multilineEnabledInput.checked,
               number_word_mode: numberWordModeInput.checked,
+              number_digit_mode: numberDigitModeInput.checked,
             }),
           });
 
@@ -470,7 +476,9 @@
           }
           metaModelEl.textContent = payload.model || "-";
           metaDeviceEl.textContent = payload.device || "-";
-          if (payload.number_word_mode && payload.raw_text) {
+          if (payload.number_digit_mode && payload.raw_text) {
+            setStatus("Nhận diện xong (đã ưu tiên chuẩn hóa về chữ số 0-9).");
+          } else if (payload.number_word_mode && payload.raw_text) {
             setStatus("Nhận diện xong (đã chuẩn hóa theo từ điển số).");
           } else {
             setStatus("Nhận diện xong.");
@@ -493,6 +501,16 @@
 
       btnClear.addEventListener("click", () => resetCanvas(true));
       btnDetect.addEventListener("click", detectText);
+      numberWordModeInput.addEventListener("change", () => {
+        if (numberWordModeInput.checked) {
+          numberDigitModeInput.checked = false;
+        }
+      });
+      numberDigitModeInput.addEventListener("change", () => {
+        if (numberDigitModeInput.checked) {
+          numberWordModeInput.checked = false;
+        }
+      });
       window.addEventListener("resize", resizeCanvas);
 
       resizeCanvas();

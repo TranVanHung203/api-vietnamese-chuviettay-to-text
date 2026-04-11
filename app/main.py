@@ -60,6 +60,7 @@ NUMBER_WORDS_SINGLE = sorted(
 DON_VI_PLAIN = "don vi"
 DONVI_PLAIN = "donvi"
 WORD_TOKEN_RE = re.compile(r"[^\W\d_]+", flags=re.UNICODE)
+DIGIT_WORD_TOKEN_RE = re.compile(r"\d+|[^\W\d_]+", flags=re.UNICODE)
 
 
 class OCRResponse(BaseModel):
@@ -70,6 +71,7 @@ class OCRResponse(BaseModel):
     raw_text: Optional[str] = None
     raw_lines: Optional[list[str]] = None
     number_word_mode: bool = False
+    number_digit_mode: bool = False
     model: str
     device: str
 
@@ -79,6 +81,7 @@ class OCRBase64Request(BaseModel):
     return_prob: bool = False
     multiline: bool = True
     number_word_mode: bool = False
+    number_digit_mode: bool = False
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -201,6 +204,78 @@ def _normalize_number_words_line(text: str) -> str:
     return " ".join(out).strip()
 
 
+# Map common Vietnamese number words (with/without marks after strip) to 0-9.
+DIGIT_PLAIN_TO_CHAR = {
+    "khong": "0",
+    "mot": "1",
+    "hai": "2",
+    "ba": "3",
+    "bon": "4",
+    "tu": "4",
+    "nam": "5",
+    "lam": "5",
+    "sau": "6",
+    "bay": "7",
+    "tam": "8",
+    "chin": "9",
+}
+
+
+def _normalize_digit_token(token: str) -> str:
+    lowered = token.lower()
+    if lowered.isdigit():
+        return lowered
+
+    token_plain = _strip_diacritics(lowered)
+    if token_plain in DIGIT_PLAIN_TO_CHAR:
+        return DIGIT_PLAIN_TO_CHAR[token_plain]
+
+    # In digit mode, always force word-like tokens to the closest 0-9 candidate.
+    best_digit = "0"
+    best_score = -1.0
+    for candidate_plain, digit_char in DIGIT_PLAIN_TO_CHAR.items():
+        score = SequenceMatcher(None, token_plain, candidate_plain).ratio()
+        if score > best_score:
+            best_score = score
+            best_digit = digit_char
+
+    return best_digit
+
+
+def _normalize_number_digits_line(text: str) -> str:
+    tokens = DIGIT_WORD_TOKEN_RE.findall(text.lower())
+    if not tokens:
+        return text.strip().lower()
+
+    out = [_normalize_digit_token(token) for token in tokens]
+    return " ".join(out).strip()
+
+
+def _normalize_text_by_number_mode(
+    text: str, number_word_mode: bool, number_digit_mode: bool
+) -> tuple[str, Optional[str]]:
+    if number_digit_mode:
+        normalized_text = _normalize_number_digits_line(text)
+    elif number_word_mode:
+        normalized_text = _normalize_number_words_line(text)
+    else:
+        return text, None
+
+    raw_text = text if normalized_text != text else None
+    return normalized_text, raw_text
+
+
+def _validate_number_modes(number_word_mode: bool, number_digit_mode: bool) -> None:
+    if number_word_mode and number_digit_mode:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "number_word_mode and number_digit_mode cannot both be true. "
+                "Please choose one mode."
+            ),
+        )
+
+
 def _line_bounds_from_mask(ink_mask: np.ndarray) -> list[tuple[int, int]]:
     height, width = ink_mask.shape
     if height == 0 or width == 0:
@@ -315,19 +390,21 @@ class OCRService:
         return_prob: bool,
         multiline: bool,
         number_word_mode: bool,
+        number_digit_mode: bool,
     ) -> OCRResponse:
         if not multiline:
             text, probability = self._predict_one(image=image, return_prob=return_prob)
-            raw_text = None
-            if number_word_mode:
-                normalized_text = _normalize_number_words_line(text)
-                raw_text = text if normalized_text != text else None
-                text = normalized_text
+            text, raw_text = _normalize_text_by_number_mode(
+                text=text,
+                number_word_mode=number_word_mode,
+                number_digit_mode=number_digit_mode,
+            )
             return OCRResponse(
                 text=text,
                 probability=probability,
                 raw_text=raw_text,
                 number_word_mode=number_word_mode,
+                number_digit_mode=number_digit_mode,
                 model=self.model_name,
                 device=self.device,
             )
@@ -335,11 +412,11 @@ class OCRService:
         line_images = _split_lines(image)
         if len(line_images) <= 1:
             text, probability = self._predict_one(image=image, return_prob=return_prob)
-            raw_text = None
-            if number_word_mode:
-                normalized_text = _normalize_number_words_line(text)
-                raw_text = text if normalized_text != text else None
-                text = normalized_text
+            text, raw_text = _normalize_text_by_number_mode(
+                text=text,
+                number_word_mode=number_word_mode,
+                number_digit_mode=number_digit_mode,
+            )
             return OCRResponse(
                 text=text,
                 probability=probability,
@@ -348,6 +425,7 @@ class OCRService:
                 raw_text=raw_text,
                 raw_lines=[raw_text] if raw_text else None,
                 number_word_mode=number_word_mode,
+                number_digit_mode=number_digit_mode,
                 model=self.model_name,
                 device=self.device,
             )
@@ -362,9 +440,16 @@ class OCRService:
             line_probs.append(line_prob)
 
         raw_lines = None
-        if number_word_mode:
+        if number_word_mode or number_digit_mode:
             original_lines = list(lines)
-            lines = [_normalize_number_words_line(line) for line in lines]
+            lines = [
+                _normalize_text_by_number_mode(
+                    text=line,
+                    number_word_mode=number_word_mode,
+                    number_digit_mode=number_digit_mode,
+                )[0]
+                for line in lines
+            ]
             if lines != original_lines:
                 raw_lines = original_lines
 
@@ -380,6 +465,7 @@ class OCRService:
             raw_text=("\n".join(raw_lines) if raw_lines else None),
             raw_lines=raw_lines,
             number_word_mode=number_word_mode,
+            number_digit_mode=number_digit_mode,
             model=self.model_name,
             device=self.device,
         )
@@ -428,7 +514,12 @@ async def ocr_from_file(
     return_prob: bool = False,
     multiline: bool = True,
     number_word_mode: bool = False,
+    number_digit_mode: bool = False,
 ) -> OCRResponse:
+    _validate_number_modes(
+        number_word_mode=number_word_mode, number_digit_mode=number_digit_mode
+    )
+
     content = await file.read()
     if not content:
         raise HTTPException(status_code=400, detail="Empty file")
@@ -440,11 +531,17 @@ async def ocr_from_file(
         return_prob=return_prob,
         multiline=multiline,
         number_word_mode=number_word_mode,
+        number_digit_mode=number_digit_mode,
     )
 
 
 @app.post("/ocr/base64", response_model=OCRResponse)
 def ocr_from_base64(payload: OCRBase64Request) -> OCRResponse:
+    _validate_number_modes(
+        number_word_mode=payload.number_word_mode,
+        number_digit_mode=payload.number_digit_mode,
+    )
+
     image_bytes = _decode_base64_image(payload.image_base64)
     image = _open_image(image_bytes)
     service = get_ocr_service()
@@ -453,4 +550,5 @@ def ocr_from_base64(payload: OCRBase64Request) -> OCRResponse:
         return_prob=payload.return_prob,
         multiline=payload.multiline,
         number_word_mode=payload.number_word_mode,
+        number_digit_mode=payload.number_digit_mode,
     )
