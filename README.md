@@ -30,6 +30,8 @@ Mở trang viết tay test nhanh: `http://localhost:8000/`
   - Nếu không set: tự chọn `cuda:0` khi có GPU, ngược lại `cpu`
 - `VIETOCR_BEAMSEARCH`: `true/false` (mặc định `true`)
 
+Model VietOCR sẽ được tải một lần và lưu trong `app/models/`; các lần khởi động sau sẽ dùng lại file này nếu nó đã tồn tại.
+
 Ví dụ chạy CPU:
 
 ```bash
@@ -62,6 +64,7 @@ Khi bật `true`, API ưu tiên chuẩn hóa số về dạng chữ số `0-9`
 Trong mode này, token dạng chữ sẽ luôn được map về chữ số gần nhất
 (không giữ lại chữ trong kết quả đã chuẩn hóa).
 Không bật đồng thời `number_word_mode=true` và `number_digit_mode=true`.
+Các dấu `+`, `-`, `=`, `:`, `*` sẽ được giữ lại trong kết quả OCR.
 
 ### OCR từ base64
 
