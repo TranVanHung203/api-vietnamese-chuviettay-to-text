@@ -15,5 +15,4 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/.venv .venv/
 COPY . .
-RUN .venv/bin/pip uninstall -y opencv-python || true
 CMD ["/app/.venv/bin/uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
