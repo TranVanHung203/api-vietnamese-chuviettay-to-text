@@ -10,14 +10,10 @@ from typing import Optional
 from urllib.request import urlretrieve
 
 import numpy as np
-import cv2
-import torch
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from PIL import Image, UnidentifiedImageError
-from vietocr.tool.config import Cfg
-from vietocr.tool.predictor import Predictor
 
 
 SUPPORTED_MODELS = {
@@ -71,6 +67,20 @@ DIGIT_PREPROCESS_PADDING = 16
 DIGIT_ALLOWED_SYMBOLS = set("+-=:*/.,()")
 
 
+@lru_cache(maxsize=1)
+def _cv2_module():
+    import cv2
+
+    return cv2
+
+
+@lru_cache(maxsize=1)
+def _torch_module():
+    import torch
+
+    return torch
+
+
 class OCRResponse(BaseModel):
     text: str
     probability: Optional[float] = None
@@ -111,6 +121,7 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 def _resolve_device() -> str:
+    torch = _torch_module()
     forced_device = os.getenv("VIETOCR_DEVICE")
     if forced_device:
         return forced_device
@@ -128,6 +139,7 @@ def _open_image(image_bytes: bytes) -> Image.Image:
 def _resize_keep_ratio(
     image_array: np.ndarray, target_height: int, max_width: int
 ) -> np.ndarray:
+    cv2 = _cv2_module()
     height, width = image_array.shape[:2]
     if height <= 0 or width <= 0:
         return image_array
@@ -171,6 +183,7 @@ def _ensure_light_background(gray: np.ndarray) -> np.ndarray:
 
 
 def _normalize_digit_background(gray: np.ndarray) -> np.ndarray:
+    cv2 = _cv2_module()
     min_side = min(gray.shape[:2])
     if min_side < 3:
         return gray
@@ -182,6 +195,7 @@ def _normalize_digit_background(gray: np.ndarray) -> np.ndarray:
 
 
 def _deskew_digit_image(binary_image: np.ndarray) -> np.ndarray:
+    cv2 = _cv2_module()
     ink_mask = binary_image < 250
     if int(ink_mask.sum()) < 20:
         return binary_image
@@ -206,6 +220,7 @@ def _deskew_digit_image(binary_image: np.ndarray) -> np.ndarray:
 
 
 def _remove_small_ink_components(binary_image: np.ndarray) -> np.ndarray:
+    cv2 = _cv2_module()
     inverted = 255 - binary_image
     component_count, labels, stats, _ = cv2.connectedComponentsWithStats(
         inverted, connectivity=8
@@ -228,6 +243,7 @@ def _remove_small_ink_components(binary_image: np.ndarray) -> np.ndarray:
 
 
 def _finish_digit_binary(binary_image: np.ndarray) -> Image.Image:
+    cv2 = _cv2_module()
     binary_image = _deskew_digit_image(binary_image)
     binary_image = _remove_small_ink_components(binary_image)
     binary_image = _crop_to_ink(binary_image)
@@ -262,6 +278,7 @@ def _dedupe_digit_variants(images: list[Image.Image]) -> list[Image.Image]:
 
 
 def _preprocess_digit_variants(image: Image.Image) -> list[Image.Image]:
+    cv2 = _cv2_module()
     gray = np.array(image.convert("L"))
     if gray.size == 0:
         return [image.convert("RGB")]
@@ -653,6 +670,9 @@ def _resolve_local_model_weights(model_name: str, weights_url: str) -> Path:
 
 class OCRService:
     def __init__(self) -> None:
+        from vietocr.tool.config import Cfg
+        from vietocr.tool.predictor import Predictor
+
         model_name = os.getenv("VIETOCR_MODEL", "vgg_transformer")
         if model_name not in SUPPORTED_MODELS:
             supported = ", ".join(sorted(SUPPORTED_MODELS))
@@ -844,7 +864,7 @@ def health() -> dict:
     return {
         "status": "ok",
         "model": os.getenv("VIETOCR_MODEL", "vgg_transformer"),
-        "device": _resolve_device(),
+        "device": os.getenv("VIETOCR_DEVICE", "auto"),
         "beamsearch": _env_bool("VIETOCR_BEAMSEARCH", True),
         "service_loaded": get_ocr_service.cache_info().currsize > 0,
     }
