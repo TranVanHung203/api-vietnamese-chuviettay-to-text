@@ -839,19 +839,14 @@ app = FastAPI(
 )
 
 
-@app.on_event("startup")
-def warmup_model() -> None:
-    get_ocr_service()
-
-
 @app.get("/health")
 def health() -> dict:
-    service = get_ocr_service()
     return {
         "status": "ok",
-        "model": service.model_name,
-        "device": service.device,
-        "beamsearch": service.beamsearch,
+        "model": os.getenv("VIETOCR_MODEL", "vgg_transformer"),
+        "device": _resolve_device(),
+        "beamsearch": _env_bool("VIETOCR_BEAMSEARCH", True),
+        "service_loaded": get_ocr_service.cache_info().currsize > 0,
     }
 
 
