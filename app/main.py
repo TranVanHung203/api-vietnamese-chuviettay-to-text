@@ -11,9 +11,10 @@ from urllib.request import urlretrieve
 
 import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 
 SUPPORTED_MODELS = {
@@ -64,7 +65,37 @@ DIGIT_WORD_TOKEN_RE = re.compile(r"\d+|[^\W\d_]+", flags=re.UNICODE)
 DIGIT_PREPROCESS_TARGET_HEIGHT = 64
 DIGIT_PREPROCESS_MAX_WIDTH = 1600
 DIGIT_PREPROCESS_PADDING = 16
-DIGIT_ALLOWED_SYMBOLS = set("+-=:*/.,()")
+DIGIT_ALLOWED_SYMBOLS = set("+-x:=,*/.()")
+MATH_OPERATOR_CHARS = set("+-x:=,")
+MATH_OPERATOR_TOKEN_MAP = {
+    "+": "+",
+    "＋": "+",
+    "plus": "+",
+    "cong": "+",
+    "cộng": "+",
+    "daucong": "+",
+    "dấu cộng": "+",
+    "-": "-",
+    "−": "-",
+    "–": "-",
+    "—": "-",
+    "minus": "-",
+    "tru": "-",
+    "trừ": "-",
+    "x": "x",
+    "X": "x",
+    "×": "x",
+    "*": "x",
+    "nhan": "x",
+    "nhân": "x",
+    ":": ":",
+    "：": ":",
+    "chia": ":",
+    "=": "=",
+    "＝": "=",
+    ",": ",",
+    "，": ",",
+}
 
 
 @lru_cache(maxsize=1)
@@ -90,6 +121,7 @@ class OCRResponse(BaseModel):
     raw_lines: Optional[list[str]] = None
     number_word_mode: bool = False
     number_digit_mode: bool = False
+    math_symbol_mode: bool = False
     model: str
     device: str
 
@@ -100,6 +132,7 @@ class OCRBase64Request(BaseModel):
     multiline: bool = True
     number_word_mode: bool = False
     number_digit_mode: bool = False
+    math_symbol_mode: bool = False
 
 
 class DigitVariantItem(BaseModel):
@@ -514,7 +547,29 @@ def _normalize_digit_token(token: str) -> str:
     return best_digit
 
 
+def _normalize_math_operator_token(token: str) -> Optional[str]:
+    value = token.strip()
+    if not value:
+        return None
+
+    if value in MATH_OPERATOR_TOKEN_MAP:
+        return MATH_OPERATOR_TOKEN_MAP[value]
+
+    lowered = value.lower()
+    if lowered in MATH_OPERATOR_TOKEN_MAP:
+        return MATH_OPERATOR_TOKEN_MAP[lowered]
+
+    plain = _strip_diacritics(lowered).replace(" ", "")
+    return MATH_OPERATOR_TOKEN_MAP.get(plain)
+
+
 def _normalize_number_digits_line(text: str) -> str:
+    """
+    Chi normalize ve chu so 0-9.
+
+    Luu y: ham nay KHONG bat cac ky tu toan hoc nua.
+    Logic + - x : = , da duoc tach sang math_symbol_mode.
+    """
     tokens = TOKEN_RE.findall(text.lower())
     if not tokens:
         return text.strip().lower()
@@ -525,26 +580,73 @@ def _normalize_number_digits_line(text: str) -> str:
             out.append(token)
             continue
 
+        # Neu OCR doc ra tu/kien tuong ung voi toan tu, bo qua trong
+        # number_digit_mode thuan. Muon bat cac ky tu nay thi bat math_symbol_mode.
+        if _normalize_math_operator_token(token) is not None:
+            continue
+
         if token.isdigit() or WORD_TOKEN_RE.fullmatch(token):
             out.append(_normalize_digit_token(token))
             continue
 
-        out.append(DIGIT_OCR_CONFUSIONS.get(token.lower(), token))
+        # Trong number_digit_mode thuan, khong ep toan tu vao ket qua.
+        # Chi giu cac confusion co the la chu so.
+        mapped = DIGIT_OCR_CONFUSIONS.get(token.lower())
+        if mapped is not None and mapped.isdigit():
+            out.append(mapped)
 
     return "".join(out).strip()
 
 
+def _normalize_math_symbols_line(text: str) -> str:
+    """
+    Normalize chuoi co chu so va ky tu toan hoc.
+
+    Ham nay chi nen dung khi math_symbol_mode=True.
+    Ho tro: 0-9 va + - x : = ,
+    """
+    tokens = TOKEN_RE.findall(text.lower())
+    if not tokens:
+        return text.strip().lower()
+
+    out: list[str] = []
+    for token in tokens:
+        if token.isspace():
+            out.append(token)
+            continue
+
+        operator = _normalize_math_operator_token(token)
+        if operator is not None:
+            out.append(operator)
+            continue
+
+        if token.isdigit() or WORD_TOKEN_RE.fullmatch(token):
+            out.append(_normalize_digit_token(token))
+            continue
+
+        mapped = DIGIT_OCR_CONFUSIONS.get(token.lower(), token)
+        operator = _normalize_math_operator_token(mapped)
+        if operator is not None:
+            out.append(operator)
+        else:
+            out.append(mapped)
+
+    allowed = set("0123456789+-x:=,")
+    return "".join(ch for ch in "".join(out).strip() if ch in allowed)
+
+
 def _score_digit_prediction(text: str, probability: Optional[float]) -> float:
+    """
+    Cham diem cho number_digit_mode thuan: uu tien chu so, khong thuong toan tu.
+    """
     normalized = _normalize_number_digits_line(text)
     compact = re.sub(r"\s+", "", normalized)
     if not compact:
         return -1.0
 
     digit_count = sum(ch.isdigit() for ch in compact)
-    allowed_count = sum(
-        ch.isdigit() or ch in DIGIT_ALLOWED_SYMBOLS for ch in compact
-    )
-    bad_count = len(compact) - allowed_count
+    bad_count = len(compact) - digit_count
+
     score = 0.0 if probability is None else probability
     score += min(digit_count, 24) * 0.03
     score -= bad_count * 0.12
@@ -554,9 +656,14 @@ def _score_digit_prediction(text: str, probability: Optional[float]) -> float:
 
 
 def _normalize_text_by_number_mode(
-    text: str, number_word_mode: bool, number_digit_mode: bool
+    text: str,
+    number_word_mode: bool,
+    number_digit_mode: bool,
+    math_symbol_mode: bool = False,
 ) -> tuple[str, Optional[str]]:
-    if number_digit_mode:
+    if math_symbol_mode:
+        normalized_text = _normalize_math_symbols_line(text)
+    elif number_digit_mode:
         normalized_text = _normalize_number_digits_line(text)
     elif number_word_mode:
         normalized_text = _normalize_number_words_line(text)
@@ -567,13 +674,17 @@ def _normalize_text_by_number_mode(
     return normalized_text, raw_text
 
 
-def _validate_number_modes(number_word_mode: bool, number_digit_mode: bool) -> None:
-    if number_word_mode and number_digit_mode:
+def _validate_number_modes(
+    number_word_mode: bool,
+    number_digit_mode: bool,
+    math_symbol_mode: bool = False,
+) -> None:
+    if number_word_mode and (number_digit_mode or math_symbol_mode):
         raise HTTPException(
             status_code=400,
             detail=(
-                "number_word_mode and number_digit_mode cannot both be true. "
-                "Please choose one mode."
+                "number_word_mode cannot be used with number_digit_mode or "
+                "math_symbol_mode. Please choose text mode or numeric/symbol mode."
             ),
         )
 
@@ -655,6 +766,682 @@ def _split_lines(image: Image.Image) -> list[Image.Image]:
     return lines
 
 
+
+
+def _active_spans(active: np.ndarray, min_len: int = 1) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    start = None
+    for idx, is_active in enumerate(active):
+        if bool(is_active) and start is None:
+            start = idx
+        elif not bool(is_active) and start is not None:
+            end = idx - 1
+            if end - start + 1 >= min_len:
+                spans.append((start, end))
+            start = None
+
+    if start is not None:
+        end = len(active) - 1
+        if end - start + 1 >= min_len:
+            spans.append((start, end))
+    return spans
+
+
+def _box_union(box_a: tuple[int, int, int, int], box_b: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    ax, ay, aw, ah = box_a
+    bx, by, bw, bh = box_b
+    x1 = min(ax, bx)
+    y1 = min(ay, by)
+    x2 = max(ax + aw, bx + bw)
+    y2 = max(ay + ah, by + bh)
+    return x1, y1, x2 - x1, y2 - y1
+
+
+def _box_horizontal_overlap_ratio(
+    box_a: tuple[int, int, int, int], box_b: tuple[int, int, int, int]
+) -> float:
+    ax, _, aw, _ = box_a
+    bx, _, bw, _ = box_b
+    overlap = max(0, min(ax + aw, bx + bw) - max(ax, bx))
+    return overlap / max(1, min(aw, bw))
+
+
+def _box_vertical_overlap_ratio(
+    box_a: tuple[int, int, int, int], box_b: tuple[int, int, int, int]
+) -> float:
+    _, ay, _, ah = box_a
+    _, by, _, bh = box_b
+    overlap = max(0, min(ay + ah, by + bh) - max(ay, by))
+    return overlap / max(1, min(ah, bh))
+
+
+def _is_horizontal_stroke_box(box: tuple[int, int, int, int]) -> bool:
+    _, _, width, height = box
+    return width >= max(5, height * 1.8)
+
+
+def _is_small_dot_box(box: tuple[int, int, int, int], line_height: int) -> bool:
+    _, _, width, height = box
+    # Dau ':' co the gom tu hai cham tron; khi anh chi co dau ':' thi line_height
+    # cung rat nho, nen khong duoc dat nguong qua chat.
+    max_dot_side = max(6, int(line_height * 1.4))
+    return width <= max_dot_side and height <= max_dot_side and 0.45 <= width / max(height, 1) <= 2.2
+
+
+def _is_equal_pair(
+    box_a: tuple[int, int, int, int], box_b: tuple[int, int, int, int]
+) -> bool:
+    ax, ay, aw, ah = box_a
+    bx, by, bw, bh = box_b
+    if not (_is_horizontal_stroke_box(box_a) and _is_horizontal_stroke_box(box_b)):
+        return False
+
+    x_overlap = _box_horizontal_overlap_ratio(box_a, box_b)
+    if x_overlap < 0.45:
+        return False
+
+    cy_a = ay + ah / 2
+    cy_b = by + bh / 2
+    vertical_gap = abs(cy_a - cy_b)
+    if vertical_gap <= max(2, min(ah, bh) * 0.8):
+        return False
+    if vertical_gap > max(18, max(ah, bh) * 5):
+        return False
+
+    width_ratio = min(aw, bw) / max(aw, bw, 1)
+    return width_ratio >= 0.45
+
+
+def _is_colon_pair(
+    box_a: tuple[int, int, int, int], box_b: tuple[int, int, int, int], line_height: int
+) -> bool:
+    ax, ay, aw, ah = box_a
+    bx, by, bw, bh = box_b
+    if not (_is_small_dot_box(box_a, line_height) and _is_small_dot_box(box_b, line_height)):
+        return False
+
+    cx_a = ax + aw / 2
+    cx_b = bx + bw / 2
+    if abs(cx_a - cx_b) > max(8, max(aw, bw) * 1.4):
+        return False
+
+    cy_a = ay + ah / 2
+    cy_b = by + bh / 2
+    vertical_gap = abs(cy_a - cy_b)
+    if vertical_gap <= max(2, min(ah, bh) * 1.2):
+        return False
+    if vertical_gap > max(26, line_height * 0.75):
+        return False
+
+    union = _box_union(box_a, box_b)
+    return union[3] >= union[2] * 1.2
+
+
+def _is_cross_pair(
+    box_a: tuple[int, int, int, int], box_b: tuple[int, int, int, int]
+) -> bool:
+    # Dung cho dau x viet roi hai net cheo khong dinh nhau.
+    x_overlap = _box_horizontal_overlap_ratio(box_a, box_b)
+    y_overlap = _box_vertical_overlap_ratio(box_a, box_b)
+    if x_overlap < 0.35 or y_overlap < 0.35:
+        return False
+
+    union = _box_union(box_a, box_b)
+    _, _, width, height = union
+    ratio = width / max(height, 1)
+    return 0.55 <= ratio <= 1.8
+
+
+def _merge_operator_component_boxes(
+    boxes: list[tuple[int, int, int, int]], line_height: int
+) -> list[tuple[int, int, int, int]]:
+    merged: list[tuple[int, int, int, int]] = []
+    used: set[int] = set()
+    boxes = sorted(boxes, key=lambda box: (box[0], box[1]))
+
+    for i, box in enumerate(boxes):
+        if i in used:
+            continue
+
+        best_j = None
+        best_priority = -1
+        for j in range(i + 1, len(boxes)):
+            if j in used:
+                continue
+            other = boxes[j]
+
+            # Chi xet cac component gan nhau de tranh gom nham chu so ke ben.
+            union = _box_union(box, other)
+            if union[2] > max(box[2], other[2]) * 2.8 and _box_horizontal_overlap_ratio(box, other) <= 0:
+                continue
+
+            if _is_equal_pair(box, other):
+                best_j = j
+                best_priority = 3
+                break
+            if _is_colon_pair(box, other, line_height) and best_priority < 2:
+                best_j = j
+                best_priority = 2
+            elif _is_cross_pair(box, other) and best_priority < 1:
+                best_j = j
+                best_priority = 1
+
+        if best_j is not None:
+            merged.append(_box_union(box, boxes[best_j]))
+            used.add(i)
+            used.add(best_j)
+        else:
+            merged.append(box)
+            used.add(i)
+
+    merged.sort(key=lambda box: box[0])
+    return merged
+
+
+def _extract_symbol_boxes(image: Image.Image) -> list[tuple[int, int, int, int]]:
+    """
+    Tach anh phep tinh thanh cac box ky tu/ky hieu theo thu tu trai sang phai.
+    Moi box co dang (x, y, width, height).
+    """
+    cv2 = _cv2_module()
+    gray = np.array(image.convert("L"))
+    if gray.size == 0:
+        return []
+
+    gray = _ensure_light_background(gray)
+    _, binary = cv2.threshold(
+        gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+    )
+
+    # Noi nhe net bi dut. Khong dilate manh de tranh dinh so voi toan tu.
+    kernel = np.ones((2, 2), dtype=np.uint8)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    component_count, _, stats, _ = cv2.connectedComponentsWithStats(
+        binary, connectivity=8
+    )
+
+    image_h, image_w = binary.shape[:2]
+    image_area = image_h * image_w
+    min_area = max(6, int(image_area * 0.00008))
+    raw_boxes: list[tuple[int, int, int, int]] = []
+
+    for component_id in range(1, component_count):
+        x, y, width, height, area = stats[component_id]
+        if area < min_area:
+            continue
+        if width < 2 or height < 3:
+            continue
+        if width > image_w * 0.95 and height > image_h * 0.95:
+            continue
+        raw_boxes.append((int(x), int(y), int(width), int(height)))
+
+    if not raw_boxes:
+        return []
+
+    line_height = max(box[3] for box in raw_boxes)
+    merged_boxes = _merge_operator_component_boxes(raw_boxes, line_height=line_height)
+
+    padded_boxes: list[tuple[int, int, int, int]] = []
+    for x, y, width, height in merged_boxes:
+        pad = max(2, min(6, int(max(width, height) * 0.18)))
+        x1 = max(0, x - pad)
+        y1 = max(0, y - pad)
+        x2 = min(image_w, x + width + pad)
+        y2 = min(image_h, y + height + pad)
+        if x2 - x1 >= 2 and y2 - y1 >= 3:
+            padded_boxes.append((x1, y1, x2 - x1, y2 - y1))
+
+    padded_boxes.sort(key=lambda box: box[0])
+    return padded_boxes
+
+
+def _ink_mask_from_crop(crop: Image.Image) -> Optional[np.ndarray]:
+    cv2 = _cv2_module()
+    gray = np.array(crop.convert("L"))
+    if gray.size == 0:
+        return None
+
+    gray = _ensure_light_background(gray)
+    _, binary = cv2.threshold(
+        gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+    )
+    ink = binary > 0
+    if int(ink.sum()) < 4:
+        return None
+
+    rows = np.where(ink.any(axis=1))[0]
+    cols = np.where(ink.any(axis=0))[0]
+    if len(rows) == 0 or len(cols) == 0:
+        return None
+    return ink[rows[0] : rows[-1] + 1, cols[0] : cols[-1] + 1]
+
+
+def _projection_scores(ink: np.ndarray) -> tuple[float, float, float]:
+    height, width = ink.shape[:2]
+    band_y = max(1, int(round(height * 0.16)))
+    band_x = max(1, int(round(width * 0.16)))
+    mid_y = height // 2
+    mid_x = width // 2
+
+    horizontal_band = ink[max(0, mid_y - band_y) : min(height, mid_y + band_y + 1), :]
+    vertical_band = ink[:, max(0, mid_x - band_x) : min(width, mid_x + band_x + 1)]
+
+    horizontal_score = horizontal_band.any(axis=0).sum() / max(width, 1)
+    vertical_score = vertical_band.any(axis=1).sum() / max(height, 1)
+
+    center = ink[
+        max(0, mid_y - band_y) : min(height, mid_y + band_y + 1),
+        max(0, mid_x - band_x) : min(width, mid_x + band_x + 1),
+    ]
+    center_density = center.sum() / max(center.size, 1)
+    return float(horizontal_score), float(vertical_score), float(center_density)
+
+
+def _corner_ink_ratio(ink: np.ndarray) -> float:
+    height, width = ink.shape[:2]
+    corner_h = max(1, height // 4)
+    corner_w = max(1, width // 4)
+    corners = [
+        ink[:corner_h, :corner_w],
+        ink[:corner_h, -corner_w:],
+        ink[-corner_h:, :corner_w],
+        ink[-corner_h:, -corner_w:],
+    ]
+    corner_ink = sum(int(corner.sum()) for corner in corners)
+    return corner_ink / max(int(ink.sum()), 1)
+
+
+def _diagonal_scores(ink: np.ndarray) -> tuple[float, float]:
+    cv2 = _cv2_module()
+    resized = cv2.resize(
+        ink.astype(np.uint8), (32, 32), interpolation=cv2.INTER_NEAREST
+    ).astype(bool)
+    ys, xs = np.where(resized)
+    if len(xs) == 0:
+        return 0.0, 0.0
+
+    diag_1 = (np.abs(ys - xs) <= 3).sum() / max(len(xs), 1)
+    diag_2 = (np.abs(ys + xs - 31) <= 3).sum() / max(len(xs), 1)
+    return float(diag_1), float(diag_2)
+
+
+
+def _classify_minus_equal_by_geometry(
+    crop: Image.Image,
+    line_height: Optional[int] = None,
+) -> Optional[str]:
+    """
+    Phan biet rieng '-' va '=' bang hinh hoc, uu tien '='.
+
+    Fix quan trong:
+    - Khong gop cac khoang trang nho giua 2 net cua '=' nua.
+    - Neu row projection thay 2 cum net ngang tach nhau, tra '=' ngay.
+    - Chi khi chi co 1 cum net ngang dai moi tra '-'.
+    """
+    cv2 = _cv2_module()
+
+    gray = np.array(crop.convert("L"))
+    if gray.size == 0:
+        return None
+
+    gray = _ensure_light_background(gray)
+    _, binary = cv2.threshold(
+        gray,
+        0,
+        255,
+        cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
+    )
+
+    ink = binary > 0
+    if int(ink.sum()) < 8:
+        return None
+
+    rows = np.where(ink.any(axis=1))[0]
+    cols = np.where(ink.any(axis=0))[0]
+    if len(rows) == 0 or len(cols) == 0:
+        return None
+
+    # Cat sat vung muc de phep do khong bi anh huong bo trang.
+    binary = binary[rows[0] : rows[-1] + 1, cols[0] : cols[-1] + 1]
+    ink = binary > 0
+
+    height, width = ink.shape[:2]
+    if height <= 0 or width <= 0:
+        return None
+
+    ratio = width / max(height, 1)
+
+    # '-' va '=' phai co dang ngang ro. Dieu kien nay tranh bat nham so 2, 3, +, x.
+    if ratio < 1.25:
+        return None
+
+    row_profile = ink.sum(axis=1) / max(width, 1)
+    col_profile = ink.sum(axis=0) / max(height, 1)
+
+    # Neu co net doc manh o giua thi co the la '+', khong xu ly o ham nay.
+    vertical_density = float(col_profile.max(initial=0.0))
+    if vertical_density >= 0.82 and ratio < 2.0:
+        return None
+
+    # ============================================================
+    # Cach 1: Row projection. Day la cach quan trong nhat voi canvas cua ban.
+    # Dau '=' co 2 cum hang co muc, tach nhau boi it nhat 1 hang trang.
+    # Khong merge gap nho, vi gap nho chinh la dau hieu cua '=' viet bang net day.
+    # ============================================================
+    thresholds = (0.12, 0.16, 0.20, 0.24)
+
+    for threshold in thresholds:
+        active_rows = row_profile >= threshold
+        spans = _active_spans(active_rows, min_len=1)
+
+        # Loc span yeu/ngan. Moi net ngang phai co do phu theo chieu ngang du lon.
+        strong_spans: list[tuple[int, int]] = []
+        for start, end in spans:
+            band_max = float(row_profile[start : end + 1].max(initial=0.0))
+            span_height = end - start + 1
+            if band_max >= max(0.18, threshold) and span_height <= max(14, int(height * 0.70)):
+                strong_spans.append((start, end))
+
+        if len(strong_spans) >= 2:
+            top_start, top_end = strong_spans[0]
+            bottom_start, bottom_end = strong_spans[-1]
+            gap = bottom_start - top_end - 1
+
+            # Voi net but day, gap co the chi 1 pixel. Van nen uu tien '='.
+            if gap >= 1:
+                return "="
+
+    # ============================================================
+    # Cach 2: Connected components. Bat truong hop 2 net cua '=' la 2 component.
+    # ============================================================
+    component_count, _, stats, _ = cv2.connectedComponentsWithStats(
+        binary,
+        connectivity=8,
+    )
+
+    horizontal_boxes: list[tuple[int, int, int, int, int]] = []
+    for component_id in range(1, component_count):
+        x, y, box_w, box_h, area = stats[component_id]
+        if area < 8:
+            continue
+
+        component_ratio = box_w / max(box_h, 1)
+        if component_ratio >= 1.8 and box_w >= max(8, int(width * 0.30)):
+            horizontal_boxes.append((int(x), int(y), int(box_w), int(box_h), int(area)))
+
+    if len(horizontal_boxes) >= 2:
+        horizontal_boxes.sort(key=lambda box: box[1])
+        top = horizontal_boxes[0]
+        bottom = horizontal_boxes[-1]
+
+        top_x, top_y, top_w, top_h, _ = top
+        bot_x, bot_y, bot_w, bot_h, _ = bottom
+
+        overlap_x = max(0, min(top_x + top_w, bot_x + bot_w) - max(top_x, bot_x))
+        overlap_ratio = overlap_x / max(1, min(top_w, bot_w))
+        vertical_gap = bot_y - (top_y + top_h)
+
+        if overlap_ratio >= 0.25 and vertical_gap >= 1:
+            return "="
+
+    # ============================================================
+    # Chi khi khong co dau hieu 2 net, moi ket luan '-'.
+    # ============================================================
+    active_rows = row_profile >= 0.20
+    spans = _active_spans(active_rows, min_len=1)
+    strong_spans: list[tuple[int, int]] = []
+    for start, end in spans:
+        band_max = float(row_profile[start : end + 1].max(initial=0.0))
+        if band_max >= 0.25:
+            strong_spans.append((start, end))
+
+    if len(strong_spans) == 1:
+        stroke_start, stroke_end = strong_spans[0]
+        stroke_height = stroke_end - stroke_start + 1
+
+        # '-' thuong la 1 net ngang dai, crop thap hon so voi chieu rong.
+        looks_flat = ratio >= 1.65
+        stroke_not_too_tall = stroke_height <= max(18, int(height * 0.88))
+
+        size_ok = True
+        if line_height is not None and line_height > height:
+            size_ok = height <= max(18, int(line_height * 0.85))
+
+        if looks_flat and stroke_not_too_tall and size_ok:
+            return "-"
+
+    if len(horizontal_boxes) == 1 and ratio >= 1.65:
+        return "-"
+
+    return None
+
+
+def _classify_math_operator_crop(crop: Image.Image, line_height: Optional[int] = None) -> Optional[str]:
+    """
+    Nhan dien rieng cac toan tu + - x : = , bang hinh hoc.
+    Ham nay chi duoc dung trong number_digit_mode, khong anh huong luong viet chu.
+    """
+    ink = _ink_mask_from_crop(crop)
+    if ink is None:
+        return None
+
+    height, width = ink.shape[:2]
+    ratio = width / max(height, 1)
+    ink_count = int(ink.sum())
+    density = ink_count / max(width * height, 1)
+    horizontal_score, vertical_score, center_density = _projection_scores(ink)
+    corner_ratio = _corner_ink_ratio(ink)
+
+    row_profile = ink.sum(axis=1) / max(width, 1)
+    col_profile = ink.sum(axis=0) / max(height, 1)
+    row_spans = _active_spans(row_profile >= 0.25, min_len=1)
+    col_spans = _active_spans(col_profile >= 0.25, min_len=1)
+    diag_1, diag_2 = _diagonal_scores(ink)
+
+    # Dau bang: hai net ngang tach nhau.
+    if ratio >= 1.15 and len(row_spans) >= 2:
+        top_span = row_spans[0]
+        bottom_span = row_spans[-1]
+        gap = bottom_span[0] - top_span[1]
+        row_span_lengths = [end - start + 1 for start, end in row_spans]
+        if gap >= 2 and max(row_span_lengths) <= max(8, int(height * 0.45)):
+            if len(col_spans) <= 2 or col_profile.max(initial=0) >= 0.35:
+                return "="
+
+    # Dau tru: mot net ngang dai.
+    if ratio >= 1.8 and len(row_spans) <= 2 and horizontal_score >= 0.55:
+        if height <= max(8, width * 0.45):
+            return "-"
+
+    # Dau nhan x: hai duong cheo cat nhau. Dat truoc dau cong vi x cung co muc o gan tam.
+    if 0.45 <= ratio <= 2.2:
+        if diag_1 >= 0.25 and diag_2 >= 0.25 and center_density >= 0.08:
+            if horizontal_score < 0.85 and vertical_score < 0.85:
+                return "x"
+
+    # Dau hai cham: hai cum muc nho theo chieu doc.
+    if ratio <= 1.25 and len(row_spans) >= 2 and len(col_spans) <= 2:
+        top_span = row_spans[0]
+        bottom_span = row_spans[-1]
+        gap = bottom_span[0] - top_span[1]
+        row_span_lengths = [end - start + 1 for start, end in row_spans]
+        if gap >= 2 and max(row_span_lengths) <= max(6, int(height * 0.45)):
+            if horizontal_score <= 0.75 and vertical_score >= 0.30 and density <= 0.75:
+                return ":"
+
+    # Dau phay: chi bat khi no nho hon chieu cao ky tu chinh trong dong.
+    # Lam nhu vay de tranh nham chu so 1 thanh dau phay.
+    if ratio <= 0.85 and height >= 4 and density <= 0.78:
+        if line_height is not None and height <= max(8, int(line_height * 0.72)):
+            return ","
+        top_ink = ink[: max(1, height // 2), :].sum()
+        bottom_ink = ink[max(1, height // 2) :, :].sum()
+        if line_height is None and bottom_ink >= top_ink * 1.25:
+            return ","
+
+    # Dau cong: co net ngang giua va net doc giua, bon goc kha trong.
+    if 0.60 <= ratio <= 2.2 and density <= 0.62:
+        if horizontal_score >= 0.38 and vertical_score >= 0.38 and center_density >= 0.12:
+            if corner_ratio <= 0.42 and not (diag_1 >= 0.25 and diag_2 >= 0.25):
+                return "+"
+
+    return None
+
+
+def _normalize_math_component_text(text: str) -> str:
+    compact = re.sub(r"\s+", "", text.strip())
+    if not compact:
+        return ""
+
+    operator = _normalize_math_operator_token(compact)
+    if operator is not None:
+        return operator
+
+    normalized = _normalize_number_digits_line(compact)
+    normalized = re.sub(r"\s+", "", normalized)
+
+    # Giu lai cac ky tu hop le cua mode uu tien so/toan tu.
+    allowed = set("0123456789+-x:=,")
+    filtered = "".join(ch for ch in normalized if ch in allowed)
+    return filtered if filtered else normalized
+
+
+
+# =========================
+# Math symbol CNN inference
+# =========================
+# Dung cho math_symbol_mode=True.
+# Model nay nhan dien 16 class: 0-9 va + - x : = ,
+# khong dung VietOCR de doan tung ky tu nua.
+
+def _math_symbol_weights_path() -> Path:
+    raw = os.getenv("MATH_SYMBOL_WEIGHTS")
+    if raw:
+        return Path(raw)
+    return APP_DIR / "weights" / "math_symbol_cnn.pt"
+
+
+def _resolve_math_symbol_device() -> str:
+    forced_device = os.getenv("MATH_SYMBOL_DEVICE")
+    if forced_device:
+        return forced_device
+    return _resolve_device()
+
+
+def _make_small_symbol_cnn(num_classes: int):
+    torch = _torch_module()
+    nn = torch.nn
+
+    class SmallSymbolCNN(nn.Module):
+        def __init__(self, num_classes: int) -> None:
+            super().__init__()
+            self.features = nn.Sequential(
+                nn.Conv2d(1, 32, 3, padding=1),
+                nn.BatchNorm2d(32),
+                nn.ReLU(inplace=True),
+                nn.MaxPool2d(2),
+                nn.Conv2d(32, 64, 3, padding=1),
+                nn.BatchNorm2d(64),
+                nn.ReLU(inplace=True),
+                nn.MaxPool2d(2),
+                nn.Conv2d(64, 128, 3, padding=1),
+                nn.BatchNorm2d(128),
+                nn.ReLU(inplace=True),
+                nn.MaxPool2d(2),
+                nn.Conv2d(128, 192, 3, padding=1),
+                nn.BatchNorm2d(192),
+                nn.ReLU(inplace=True),
+                nn.AdaptiveAvgPool2d((1, 1)),
+            )
+            self.classifier = nn.Sequential(
+                nn.Flatten(),
+                nn.Dropout(0.25),
+                nn.Linear(192, num_classes),
+            )
+
+        def forward(self, x):
+            return self.classifier(self.features(x))
+
+    return SmallSymbolCNN(num_classes=num_classes)
+
+
+def _normalize_symbol_image_for_model(
+    image: Image.Image, img_size: int = 64, pad: int = 8
+) -> Image.Image:
+    gray = image.convert("L")
+    arr = np.array(gray)
+    if arr.size == 0:
+        return Image.new("L", (img_size, img_size), 255)
+
+    border = np.concatenate([arr[0, :], arr[-1, :], arr[:, 0], arr[:, -1]])
+    if float(np.median(border)) < 127.0:
+        gray = ImageOps.invert(gray)
+        arr = np.array(gray)
+
+    ink = arr < 245
+    if int(ink.sum()) > 4:
+        ys, xs = np.where(ink)
+        gray = gray.crop(
+            (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
+        )
+
+    width, height = gray.size
+    side = max(width, height) + 2 * pad
+    canvas = Image.new("L", (side, side), 255)
+    canvas.paste(gray, ((side - width) // 2, (side - height) // 2))
+    return canvas.resize((img_size, img_size), Image.Resampling.LANCZOS)
+
+
+class MathSymbolClassifier:
+    def __init__(self, weights_path: Path, device: str) -> None:
+        torch = _torch_module()
+        self.torch = torch
+        self.device = device
+        self.weights_path = weights_path
+
+        if not weights_path.exists():
+            raise RuntimeError(
+                "Math symbol model not found. Train it first or set "
+                f"MATH_SYMBOL_WEIGHTS. Missing file: {weights_path}"
+            )
+
+        checkpoint = torch.load(str(weights_path), map_location=device)
+        self.class_names = checkpoint["class_names"]
+        self.class_to_symbol = checkpoint["class_to_symbol"]
+        self.img_size = int(checkpoint.get("img_size", 64))
+
+        self.model = _make_small_symbol_cnn(num_classes=len(self.class_names))
+        self.model.load_state_dict(checkpoint["model_state"])
+        self.model.to(device)
+        self.model.eval()
+
+    def predict(self, image: Image.Image) -> tuple[str, float]:
+        torch = self.torch
+        normalized = _normalize_symbol_image_for_model(
+            image, img_size=self.img_size
+        )
+        arr = np.array(normalized).astype(np.float32) / 255.0
+        arr = (arr - 0.5) / 0.5
+        tensor = torch.from_numpy(arr).unsqueeze(0).unsqueeze(0).to(self.device)
+
+        with torch.no_grad():
+            probabilities = torch.softmax(self.model(tensor), dim=1)[0]
+
+        index = int(torch.argmax(probabilities).item())
+        class_name = self.class_names[index]
+        symbol = self.class_to_symbol[class_name]
+        confidence = float(probabilities[index].item())
+        return symbol, confidence
+
+
+@lru_cache(maxsize=1)
+def get_math_symbol_classifier() -> MathSymbolClassifier:
+    return MathSymbolClassifier(
+        weights_path=_math_symbol_weights_path(),
+        device=_resolve_math_symbol_device(),
+    )
+
 def _resolve_local_model_weights(model_name: str, weights_url: str) -> Path:
     MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     local_weights = MODEL_CACHE_DIR / f"{model_name}.pth"
@@ -731,6 +1518,71 @@ class OCRService:
         )
         return text, (best_probability if return_prob else None), raw_text
 
+    def _predict_math_components(
+        self, image: Image.Image, return_prob: bool
+    ) -> tuple[str, Optional[float], Optional[str]]:
+        """
+        math_symbol_mode=True:
+        - OpenCV tach tung box ky tu/ky hieu.
+        - CNN 16 class nhan dien moi box: 0-9 va + - x : = ,
+        - Khong dung VietOCR trong nhanh nay nua.
+        """
+        try:
+            classifier = get_math_symbol_classifier()
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        boxes = _extract_symbol_boxes(image)
+        if not boxes:
+            symbol, confidence = classifier.predict(image)
+            return symbol, (confidence if return_prob else None), f"{symbol}:{confidence:.4f}"
+
+        parts: list[str] = []
+        raw_parts: list[str] = []
+        probabilities: list[float] = []
+
+        line_height = max(height for _, _, _, height in boxes)
+
+        for x, y, width, height in boxes:
+            crop = image.crop((x, y, x + width, y + height))
+
+            # '-' và '=' rất dễ bị CNN nhầm nhau. Hậu kiểm bằng hình học trước:
+            # một nét ngang dài => '-', hai nét ngang tách nhau => '='.
+            geometry_symbol = _classify_minus_equal_by_geometry(
+                crop, line_height=line_height
+            )
+            if geometry_symbol is not None:
+                symbol = geometry_symbol
+                confidence = 1.0
+            else:
+                symbol, confidence = classifier.predict(crop)
+
+            parts.append(symbol)
+            raw_parts.append(f"{symbol}:{confidence:.4f}")
+            probabilities.append(confidence)
+
+        merged_text = "".join(parts)
+        probability = None
+        if return_prob and probabilities:
+            probability = sum(probabilities) / len(probabilities)
+
+        raw_text = " ".join(raw_parts)
+        return merged_text, probability, raw_text
+
+    def _active_response_model(self, math_symbol_mode: bool) -> str:
+        if math_symbol_mode:
+            return "math_symbol_cnn"
+        return self.model_name
+
+    def _active_response_device(self, math_symbol_mode: bool) -> str:
+        if not math_symbol_mode:
+            return self.device
+        try:
+            return get_math_symbol_classifier().device
+        except Exception:  # noqa: BLE001
+            return _resolve_math_symbol_device()
+
+
     def recognize(
         self,
         image: Image.Image,
@@ -738,9 +1590,14 @@ class OCRService:
         multiline: bool,
         number_word_mode: bool,
         number_digit_mode: bool,
+        math_symbol_mode: bool = False,
     ) -> OCRResponse:
         if not multiline:
-            if number_digit_mode:
+            if math_symbol_mode:
+                text, probability, raw_text = self._predict_math_components(
+                    image=image, return_prob=return_prob
+                )
+            elif number_digit_mode:
                 text, probability, raw_text = self._predict_digit_best(
                     image=image, return_prob=return_prob
                 )
@@ -752,6 +1609,7 @@ class OCRService:
                     text=text,
                     number_word_mode=number_word_mode,
                     number_digit_mode=number_digit_mode,
+                    math_symbol_mode=math_symbol_mode,
                 )
             return OCRResponse(
                 text=text,
@@ -759,16 +1617,18 @@ class OCRService:
                 raw_text=raw_text,
                 number_word_mode=number_word_mode,
                 number_digit_mode=number_digit_mode,
-                model=self.model_name,
-                device=self.device,
+                math_symbol_mode=math_symbol_mode,
+                model=self._active_response_model(math_symbol_mode),
+                device=self._active_response_device(math_symbol_mode),
             )
-
-        if number_digit_mode:
-            image = _preprocess_digit_image(image)
 
         line_images = _split_lines(image)
         if len(line_images) <= 1:
-            if number_digit_mode:
+            if math_symbol_mode:
+                text, probability, raw_text = self._predict_math_components(
+                    image=image, return_prob=return_prob
+                )
+            elif number_digit_mode:
                 text, probability, raw_text = self._predict_digit_best(
                     image=image, return_prob=return_prob
                 )
@@ -780,6 +1640,7 @@ class OCRService:
                     text=text,
                     number_word_mode=number_word_mode,
                     number_digit_mode=number_digit_mode,
+                    math_symbol_mode=math_symbol_mode,
                 )
             return OCRResponse(
                 text=text,
@@ -790,15 +1651,21 @@ class OCRService:
                 raw_lines=[raw_text] if raw_text else None,
                 number_word_mode=number_word_mode,
                 number_digit_mode=number_digit_mode,
-                model=self.model_name,
-                device=self.device,
+                math_symbol_mode=math_symbol_mode,
+                model=self._active_response_model(math_symbol_mode),
+                device=self._active_response_device(math_symbol_mode),
             )
 
         lines: list[str] = []
         line_probs: list[Optional[float]] = []
         raw_line_candidates: list[str] = []
         for line_image in line_images:
-            if number_digit_mode:
+            if math_symbol_mode:
+                line_text, line_prob, raw_line = self._predict_math_components(
+                    image=line_image, return_prob=return_prob
+                )
+                raw_line_candidates.append(raw_line if raw_line else line_text)
+            elif number_digit_mode:
                 line_text, line_prob, raw_line = self._predict_digit_best(
                     image=line_image, return_prob=return_prob
                 )
@@ -811,7 +1678,7 @@ class OCRService:
             line_probs.append(line_prob)
 
         raw_lines = None
-        if number_digit_mode:
+        if math_symbol_mode or number_digit_mode:
             if raw_line_candidates != lines:
                 raw_lines = raw_line_candidates
         elif number_word_mode:
@@ -821,6 +1688,7 @@ class OCRService:
                     text=line,
                     number_word_mode=number_word_mode,
                     number_digit_mode=number_digit_mode,
+                    math_symbol_mode=math_symbol_mode,
                 )[0]
                 for line in lines
             ]
@@ -840,8 +1708,9 @@ class OCRService:
             raw_lines=raw_lines,
             number_word_mode=number_word_mode,
             number_digit_mode=number_digit_mode,
-            model=self.model_name,
-            device=self.device,
+            math_symbol_mode=math_symbol_mode,
+            model=self._active_response_model(math_symbol_mode),
+            device=self._active_response_device(math_symbol_mode),
         )
 
 
@@ -856,6 +1725,14 @@ app = FastAPI(
     description=(
         "OCR API for Vietnamese handwritten/printed line images using VietOCR."
     ),
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -884,9 +1761,12 @@ async def ocr_from_file(
     multiline: bool = True,
     number_word_mode: bool = False,
     number_digit_mode: bool = False,
+    math_symbol_mode: bool = False,
 ) -> OCRResponse:
     _validate_number_modes(
-        number_word_mode=number_word_mode, number_digit_mode=number_digit_mode
+        number_word_mode=number_word_mode,
+        number_digit_mode=number_digit_mode,
+        math_symbol_mode=math_symbol_mode,
     )
 
     content = await file.read()
@@ -901,6 +1781,7 @@ async def ocr_from_file(
         multiline=multiline,
         number_word_mode=number_word_mode,
         number_digit_mode=number_digit_mode,
+        math_symbol_mode=math_symbol_mode,
     )
 
 
@@ -909,6 +1790,7 @@ def ocr_from_base64(payload: OCRBase64Request) -> OCRResponse:
     _validate_number_modes(
         number_word_mode=payload.number_word_mode,
         number_digit_mode=payload.number_digit_mode,
+        math_symbol_mode=payload.math_symbol_mode,
     )
 
     image_bytes = _decode_base64_image(payload.image_base64)
@@ -920,6 +1802,7 @@ def ocr_from_base64(payload: OCRBase64Request) -> OCRResponse:
         multiline=payload.multiline,
         number_word_mode=payload.number_word_mode,
         number_digit_mode=payload.number_digit_mode,
+        math_symbol_mode=payload.math_symbol_mode,
     )
 
 
