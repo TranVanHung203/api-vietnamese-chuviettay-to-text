@@ -1,4 +1,4 @@
-# fly.toml app configuration file generated for api-vietnamese-chuviettay-to-text on 2026-06-01T01:09:56Z
+# fly.toml app configuration file generated for api-vietnamese-chuviettay-to-text on 2026-06-24T07:13:53Z
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
@@ -11,7 +11,7 @@ primary_region = 'sin'
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = 'stop'
+  auto_stop_machines = true
   auto_start_machines = true
   min_machines_running = 0
   processes = ['app']
@@ -20,3 +20,11 @@ primary_region = 'sin'
   cpu_kind = 'shared'
   cpus = 1
   memory = '1gb'
+
+[[vm]]
+  cpu_kind = 'shared'
+  cpus = 1
+  memory = '2gb'
+  memory_mb = 2048
+  processes = ['app']
+  size = 'shared-cpu-1x'
